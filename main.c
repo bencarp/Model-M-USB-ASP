@@ -9,11 +9,20 @@
 
 #include "usbdrv/usbdrv.h"
 
+/*
+ * USBasp 10-pin header wiring:
+ *   pin 1 PB3 = PS/2 Data, pin 7 PB5 = PS/2 Clock
+ *   pin 5 PB2 = SPI SS (jumpered to ground on pin 8)
+ *   pin 9 PB4 = Clock assist through a 1N4148, stripe toward pin 9
+ *   pin 2 = +5 V, pin 10 = PS/2 Ground
+ * Pins 4 and 6 are signals on this USBasp revision, not ground.
+ */
 #define PS2_CLOCK_BIT  PB5
 #define PS2_DATA_BIT   PB3
 #define PS2_SELECT_BIT PB2
 #define PS2_ASSIST_BIT PB4
 #define PS2_BUFFER_SIZE 16
+/* Timer1 runs at 1.5 MHz; 1500 ticks requires 1 ms of bus inactivity. */
 #define PS2_IDLE_TICKS 1500
 #define PS2_TRACE_SIZE 16
 
@@ -65,6 +74,7 @@ static uchar extendedPrefix = 0;
 static uchar pauseIndex = 0;
 static unsigned int idleElapsedMs = 0;
 
+/* Raw set-2 bytes are assembled by SPI and passed to the main loop here. */
 static volatile uchar ps2Buffer[PS2_BUFFER_SIZE];
 static volatile uchar ps2BufferHead = 0;
 static volatile uchar ps2BufferTail = 0;
@@ -91,6 +101,7 @@ static uchar ps2TraceHead = 0;
 static uchar ps2TraceCount = 0;
 static uchar diagnosticReply[8];
 
+/* Unprefixed IBM set-2 scan codes indexed directly to USB HID usages. */
 static PROGMEM const uchar set2ToHid[256] = {
     [0x01] = 0x42, [0x03] = 0x3e, [0x04] = 0x3c, [0x05] = 0x3a,
     [0x06] = 0x3b, [0x07] = 0x45, [0x09] = 0x43, [0x0a] = 0x41,
@@ -141,6 +152,7 @@ static void ps2QueueByte(uchar value)
 
 static void ps2ConsumeBit(uchar bit)
 {
+    /* A PS/2 frame is start, eight LSB-first data bits, odd parity, stop. */
     if (ps2BitCount == 0) {
         if (bit == 0) {
             ps2Data = 0;
@@ -193,6 +205,7 @@ static uchar ps2ReadSpi(uchar *bits)
     if (!(SPSR & (1 << SPIF)))
         return 0;
 
+    /* AVR clears SPIF only when SPSR is read before SPDR. */
     status = SPSR;
     *bits = SPDR;
     (void)status;
@@ -222,6 +235,12 @@ static void ps2ServiceSpi(void)
         (unsigned int)(TCNT1 - ps2LastClockChange) < PS2_IDLE_TICKS)
         return;
 
+    /*
+     * SPI reports only complete groups of eight clocks, while PS/2 frames
+     * contain eleven bits. After the keyboard goes idle, PB4/MISO pulls the
+     * Clock line low through the diode to finish the pending SPI byte. SS must
+     * remain grounded or the AVR tri-states MISO and these pulses disappear.
+     */
     statAssistFlushes++;
     for (uchar pulses = 0;
          !(SPSR & (1 << SPIF)) && pulses < 8;
@@ -389,6 +408,7 @@ static void processScanCode(uchar scanCode)
 
 static usbMsgLen_t diagnosticRequest(uchar request, uchar page)
 {
+    /* Vendor requests expose counters and the last 16 accepted scan bytes. */
     memset(diagnosticReply, 0, sizeof(diagnosticReply));
 
     if (request == 0x40) {
@@ -503,7 +523,7 @@ int main(void)
 
     usbDeviceConnect();
 
-    /* Pin 5 must hold SS low externally. PB4 is normally high impedance. */
+    /* Header pin 5 must be jumpered to confirmed ground on pin 8. */
     TCCR1B = 1 << CS11;
     DDRB &= ~((1 << PS2_SELECT_BIT) | (1 << PS2_DATA_BIT) |
               (1 << PS2_ASSIST_BIT));
